@@ -1282,7 +1282,7 @@ Designed so each phase takes roughly **equal implementation effort** (~4-5 hours
 | Feedback collector | `eval/feedback.py` — `save_correction()`, `analyze_corrections()` |
 | Before/after accuracy comparison | `feedback rerun` command showing improvement |
 
-**Deliverable:** `varick eval` shows accuracy report. `varick shadow` produces review output. `varick feedback` cycle works end-to-end.
+**Deliverable:** `gl eval` shows accuracy report. `gl shadow` produces review output. `gl feedback` cycle works end-to-end.
 
 ### Phase 4: CLI, HITL & Polish (~4 hrs)
 **Goal:** Full CLI, human-in-the-loop flow, end-to-end tests, README.
@@ -1290,7 +1290,7 @@ Designed so each phase takes roughly **equal implementation effort** (~4-5 hours
 | Task | Output |
 |------|--------|
 | CLI entry point with all subcommands | `main.py` using Click |
-| HITL: save pending state + resume command | `varick resume <id> --approve/--reject` |
+| HITL: save pending state + resume command | `gl resume <id> --approve/--reject` |
 | End-to-end test for all 6 invoices | `tests/test_e2e.py` — full pipeline assertions |
 | README | Architecture, setup, design decisions, tradeoffs |
 | Edge case handling | Unclassifiable items, partial matches, rounding |

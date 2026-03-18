@@ -1,7 +1,13 @@
 [project]
 name = "varick"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI agent for Accounts Payable automation"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pydantic>=2.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+gl = "main:cli"
