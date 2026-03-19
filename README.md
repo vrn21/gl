@@ -498,7 +498,7 @@ The system currently requires pre-structured JSON invoices. Real-world invoices 
 ## Project Structure
 
 ```
-varick/
+gl/
 ├── main.py                     # CLI entry point (Click) — all commands
 ├── pyproject.toml              # Project metadata & dependencies
 ├── .env                        # API keys (gitignored)
