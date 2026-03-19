@@ -1,114 +1,144 @@
 import pytest
 from decimal import Decimal
-from datetime import date
-
-from src.models import Invoice, LineItem, PurchaseOrder, ServicePeriod, ProcessingResult, ApprovalLevel
 from src.engine import Engine
-
-class MockStore:
-    def __init__(self):
-        self.posted = set()
-        self.pending = {}
-        self.flagged = []
-        self.journals = []
-        
-    def is_posted(self, invoice_id):
-        return invoice_id in self.posted
-        
-    def is_pending(self, invoice_id):
-        return invoice_id in self.pending
-        
-    def save_flagged(self, result):
-        self.flagged.append(result)
-        
-    def save_pending(self, result):
-        self.pending[result.invoice_id] = result
-        
-    def save_journal(self, result):
-        self.journals.append(result)
-        self.posted.add(result.invoice_id)
-        
-    def get_pending(self, invoice_id):
-        return self.pending.get(invoice_id)
-        
-    def delete_pending(self, invoice_id):
-        if invoice_id in self.pending:
-            del self.pending[invoice_id]
+from src.store import Store
+from src.fixtures import load_invoice, load_purchase_orders
 
 @pytest.fixture
-def store():
-    return MockStore()
+def engine(tmp_path):
+    store = Store(db_path=tmp_path / "test.db")
+    po_store = load_purchase_orders()
+    return Engine(store=store, po_store=po_store)
 
-@pytest.fixture
-def po_store():
-    return {
-        "PO-001": PurchaseOrder(number="PO-001", vendor="V", amount=Decimal("24000"), department="Engineering"),
-        "PO-002": PurchaseOrder(number="PO-002", vendor="V", amount=Decimal("100"), department="Marketing"),
-    }
+def test_inv001_cloudware_prepaid(engine):
+    """INV-001: $24K annual software license → 1310 prepaid + 12 amortization entries."""
+    inv = load_invoice("INV-001")
+    result = engine.process(inv, dry_run=True)
 
-def make_invoice(id, po, dept, lines, date_=None) -> Invoice:
-    total = sum(l.amount for l in lines)
-    if not date_:
-        date_ = date(2026, 1, 15)
-    return Invoice(
-        id=id, vendor="V", po_number=po, date=date_,
-        department=dept, line_items=lines, total=total
+    assert result.status == "pending_approval"
+    assert len(result.classifications) == 1
+
+    cl = result.classifications[0].classification
+    assert cl.gl_code == "1310"
+    assert cl.treatment.value == "prepaid"
+
+    # 1 initial + 12 amortization = 13 entries
+    assert len(result.journal_entries) == 13
+    assert result.journal_entries[0].entry_type == "initial"
+    assert all(e.entry_type == "amortization" for e in result.journal_entries[1:])
+
+    # Amortization sum = $24,000
+    amort_total = sum(
+        l.debit for e in result.journal_entries[1:] for l in e.lines
+        if l.account_code == "5010"
     )
+    assert amort_total == Decimal("24000.00")
 
-def test_engine_inv_001_prepaid(store, po_store):
-    # INV-001: 1310 prepaid + 12 amortization entries
-    # Amount 24000. Dept Engineering. PO PO-001
-    lines = [
-        LineItem(
-            description="Annual Platform License",
-            amount=Decimal("24000"),
-            service_period=ServicePeriod(start=date(2026,1,1), end=date(2026,12,31))
-        )
-    ]
-    inv = make_invoice("INV-001", "PO-001", "Engineering", lines)
-    
-    engine = Engine(store, po_store)
-    res = engine.process(inv, dry_run=True)
-    
-    assert res.status == "pending_approval" # > 10000 -> VP Finance
-    assert res.approval.level == ApprovalLevel.VP_FINANCE
-    assert len(res.journal_entries) == 13 # 1 initial + 12 amort
-    # 1st is initial
-    assert res.journal_entries[0].entry_type == "initial"
-    assert res.journal_entries[0].lines[0].account_code == "1310"
+    assert result.approval.level.value == "vp_finance"
 
-def test_engine_inv_006_flagged_no_po(store, po_store):
-    # No PO provided -> flagged early
-    lines = [LineItem(description="Office supplies", amount=Decimal("100"))]
-    inv = make_invoice("INV-006", None, "Operations", lines)
-    
-    engine = Engine(store, po_store)
-    res = engine.process(inv, dry_run=True)
-    
-    assert res.status == "flagged"
-    assert res.po_result.status == "no_po"
-    assert len(res.journal_entries) == 0
+def test_inv002_morrison_burke_legal(engine):
+    """INV-002: 3 professional service lines → 5030/5040/5030."""
+    inv = load_invoice("INV-002")
+    result = engine.process(inv, dry_run=True)
 
-def test_resume_flow(store, po_store):
-    lines = [LineItem(description="Office supplies", amount=Decimal("100"))]
-    inv = make_invoice("INV-002", "PO-002", "Marketing", lines)
-    engine = Engine(store, po_store)
+    gls = [cl.classification.gl_code for cl in result.classifications]
+    assert gls == ["5030", "5040", "5030"]
+    assert all(cl.classification.treatment.value == "expense"
+               for cl in result.classifications)
+    assert result.approval.level.value == "dept_manager"
+
+def test_inv003_techdirect_mixed(engine):
+    """INV-003: Mixed invoice — laptops (5110), server (1500), AWS prepaid (1300)."""
+    inv = load_invoice("INV-003")
+    result = engine.process(inv, dry_run=True)
+
+    gls = [cl.classification.gl_code for cl in result.classifications]
+    treatments = [cl.classification.treatment.value for cl in result.classifications]
+    assert gls == ["5110", "1500", "1300"]
+    assert treatments == ["expense", "capitalize", "prepaid"]
+    assert result.approval.level.value == "vp_finance"  # Any 1500 → VP Finance
+
+def test_inv004_apex_accrual(engine):
+    """INV-004: Dec 2025 service billed Jan 2026 → accrual entries."""
+    inv = load_invoice("INV-004")
+    result = engine.process(inv, dry_run=True)
+
+    # Both lines should be accrual
+    for cl in result.classifications:
+        assert cl.classification.treatment.value == "accrual"
+
+    # Check posting_gl (accrual accounts set by recognition)
+    posting_gls = [cl.classification.posting_gl for cl in result.classifications]
+    assert posting_gls == ["2110", "2100"]
+
+    # Each accrual line produces 2 entries (accrual + reversal) = 4 total
+    assert len(result.journal_entries) == 4
+    types = [e.entry_type for e in result.journal_entries]
+    assert types.count("accrual") == 2
+    assert types.count("reversal") == 2
+
+def test_inv005_brightspark_branded_merch(engine):
+    """INV-005: Branded merch → 5000, marketing → 5050. Merch exception tested."""
+    inv = load_invoice("INV-005")
+    result = engine.process(inv, dry_run=True)
+
+    gls = [cl.classification.gl_code for cl in result.classifications]
+    assert gls == ["5050", "5000", "5050", "5000"]
+    assert result.approval.level.value == "vp_finance"
+
+def test_inv006_no_po_flagged(engine):
+    """INV-006: No PO → flagged, no classifications, no approval."""
+    inv = load_invoice("INV-006")
+    result = engine.process(inv, dry_run=True)
+
+    assert result.status == "flagged"
+    assert len(result.classifications) == 0
+    assert result.approval is None
+    assert any("PO" in err for err in result.errors)
+
+def test_hitl_resume_approve(engine):
+    """Test the full pending → approve → posted flow."""
+    inv = load_invoice("INV-003")  # Goes to vp_finance → pending
+    result = engine.process(inv)
+    assert result.status == "pending_approval"
+
+    # Resume with approval
+    result = engine.resume("INV-003", approved=True)
+    assert result.status == "posted"
+    assert result.approval.approved is True
+
+    # Verify entries were saved
+    assert engine.store.has_journal_entries("INV-003")
+
+def test_hitl_resume_reject(engine):
+    """Test the pending → reject flow."""
+    inv = load_invoice("INV-003")
+    engine.process(inv)
+
+    result = engine.resume("INV-003", approved=False)
+    assert result.status == "rejected"
+    assert result.approval.approved is False
+    assert not engine.store.has_journal_entries("INV-003")
+
+def test_idempotency_guard(engine):
+    """Cannot process an already-posted invoice."""
+    inv = load_invoice("INV-005")
     
-    # Process normally (not dry_run) - will AUTO approve
-    res = engine.process(inv)
-    assert res.status == "posted"
-    assert store.is_posted("INV-002")
-    
-    # What if we process a VP_FINANCE one?
-    lines2 = [LineItem(description="MacBook Pro", amount=Decimal("24000"), unit_cost=Decimal("24000"))]
-    inv2 = make_invoice("INV-003", "PO-001", "Engineering", lines2) # 24k matches PO-001
-    
-    res2 = engine.process(inv2)
-    assert res2.status == "pending_approval"
-    assert store.is_pending("INV-003")
-    
-    # Resume accept
-    res3 = engine.resume("INV-003", True)
-    assert res3.status == "posted"
-    assert store.is_posted("INV-003")
-    assert not store.is_pending("INV-003")
+    # Simulate auto-approve by using a small invoice, or manually post
+    # For testing: directly save some journal entries
+    from src.models import JournalEntry, JournalLine
+    from uuid import uuid4
+    from datetime import date
+    entry = JournalEntry(
+        id=str(uuid4()), invoice_id="INV-005", date=date.today(),
+        description="test", entry_type="initial",
+        lines=[JournalLine(account_code="5050", account_name="test",
+                           debit=Decimal("1"), memo="test"),
+               JournalLine(account_code="2000", account_name="test",
+                           credit=Decimal("1"), memo="test")]
+    )
+    engine.store.save_journal_entries([entry])
+
+    result = engine.process(inv)
+    assert result.status == "error"
+    assert "already posted" in result.errors[0].lower()

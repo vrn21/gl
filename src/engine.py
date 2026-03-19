@@ -23,11 +23,11 @@ class Engine:
         if not (dry_run or shadow):
             # Assumes store has methods to check if already posted or pending
             # If so, raise or return error. For simplicity, we assume store.get_result(id) exists if needed.
-            if self.store.is_posted(invoice.id):
+            if self.store.has_journal_entries(invoice.id):
                 result.status = "error"
                 result.errors.append(f"Invoice {invoice.id} already posted")
                 return result
-            if self.store.is_pending(invoice.id):
+            if self.store.has_pending(invoice.id):
                 result.status = "error" 
                 result.errors.append(f"Invoice {invoice.id} is already pending approval")
                 return result
@@ -38,9 +38,9 @@ class Engine:
         if not po_result.matched:
             result.status = "flagged"
             if po_result.reason:
-                result.warnings.append(po_result.reason)
+                result.errors.append(po_result.reason)
             if not (dry_run or shadow):
-                self.store.save_flagged(result)
+                self.store.save_pending(result)
             return result
             
         # Step 2: GL Classification
@@ -54,7 +54,7 @@ class Engine:
             result.status = "flagged"
             result.warnings.append("One or more line items could not be classified")
             if not (dry_run or shadow):
-                self.store.save_flagged(result)
+                self.store.save_pending(result)
             return result
             
         # Step 3: Journal entries (Recognition)
@@ -108,21 +108,26 @@ class Engine:
             self.store.save_pending(result)
         else:
             result.status = "posted"
-            self.store.save_journal(result)
+            self.store.save_journal_entries(result.journal_entries)
             
         return result
 
     def resume(self, invoice_id: str, approved: bool) -> ProcessingResult:
-        result = self.store.get_pending(invoice_id)
-        if not result:
-            raise ValueError(f"No pending invoice found with id {invoice_id}")
+        result = self.store.load_pending(invoice_id)
+        
+        if result.approval:
+            result.approval.approved = approved
             
         if not approved:
             result.status = "rejected"
             self.store.delete_pending(invoice_id)
             return result
             
-        # If approved: re-verify and save
+        if result.invoice_total is None:
+            result.status = "error"
+            result.errors.append("Verification failed: invoice total is missing.")
+            return result
+
         if not verify_journal_entries(result.journal_entries, result.invoice_total):
             result.status = "error"
             result.errors.append("Verification failed during resume")
@@ -130,5 +135,5 @@ class Engine:
             
         result.status = "posted"
         self.store.delete_pending(invoice_id)
-        self.store.save_journal(result)
+        self.store.save_journal_entries(result.journal_entries)
         return result
