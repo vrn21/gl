@@ -8,7 +8,7 @@ DEFAULT_DB_PATH = Path(__file__).parent.parent / "gl.db"
 class Store:
     def __init__(self, db_path: Path | str = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.init_db()
 

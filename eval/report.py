@@ -82,24 +82,18 @@ def format_shadow_report(results: list[ProcessingResult], invoices: list[Invoice
     for res in results:
         inv = inv_lookup.get(res.invoice_id)
         vendor = inv.vendor if inv else "Unknown Vendor"
-        out.append(f"{res.invoice_id} | {vendor} | ${res.invoice_total:,.0f}")
+        out.append(f"{res.invoice_id} | {vendor}")
         if res.classifications:
             for i, cl in enumerate(res.classifications):
-                if cl.classification:
-                    gl = cl.classification.posting_gl or cl.classification.gl_code
-                    out.append(f"  Line {i+1}: {cl.line_item.description} → {gl} ({cl.classification.treatment.value})")
-                    if cl.classification.treatment.value in ("prepaid", "capitalize"):
-                        # Dummy amortization print if applicable or just omit it since it's an example in the spec
-                        pass
+                out.append(f"  Line {i+1}: {cl.description} → {cl.gl_code} ({cl.treatment})")
         
-        if res.approval:
-            out.append(f"  Approval: {res.approval.level.value}")
+        if res.approval_level:
+            out.append(f"  Approval: {res.approval_level}")
         
         out.append("  Rule traces:")
         if res.classifications:
             for i, cl in enumerate(res.classifications):
-                if cl.classification:
-                    out.append(f"    Line {i+1}: {cl.classification.rule_applied}")
+                out.append(f"    Line {i+1}: {cl.rule_applied}")
         out.append("")
     
     out.append("Proposals saved to: data/shadow_results.json")

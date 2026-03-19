@@ -1,6 +1,7 @@
 import click
+import json
 from pathlib import Path
-from src.engine import Engine
+from src.agent import process_invoice, ap_agent, AgentDeps
 from src.store import Store
 from src.fixtures import load_invoices, load_invoice, load_purchase_orders
 from src.models import ProcessingResult
@@ -24,17 +25,20 @@ def process(invoice_id: str, dry_run: bool):
         raise SystemExit(1)
 
     store = Store()
-    po_store = load_purchase_orders()
-    engine = Engine(store=store, po_store=po_store)
-    
-    result = engine.process(inv, dry_run=dry_run)
+    result = process_invoice(inv, store, dry_run=dry_run)
     _print_result(result)
     
     if result.status == "pending_approval":
+        # Serialize the full result to the pending_approvals table
+        store.save_pending(inv.id, result.model_dump_json())
         click.echo("")
-        click.echo(f"⏸ Invoice saved for approval. Run:")
-        click.echo(f"  gl resume {invoice_id} --approve")
-        click.echo(f"  gl resume {invoice_id} --reject")
+        click.echo(f"⏸ Invoice {inv.id} requires {result.approval_level} approval.")
+        click.echo(f"  Reason: {result.approval_reason}")
+        click.echo(f"  Run: gl resume {invoice_id} --approve")
+        click.echo(f"       gl resume {invoice_id} --reject")
+    elif result.status == "posted":
+        entries = result.journal_entries or []
+        click.echo(f"✅ Invoice {inv.id} posted. {len(entries)} entries saved.")
 
 # ─── Eval Command ───
 
@@ -44,24 +48,24 @@ def eval():
     from eval.runner import run_eval
     from eval.report import format_report
     store = Store()
-    po_store = load_purchase_orders()
-    engine = Engine(store=store, po_store=po_store)
-    invoices = [inv for inv in load_invoices() if inv.id.startswith("INV-")]
-    report = run_eval(engine, invoices)
+    report = run_eval(store)
     click.echo(format_report(report))
 
 # ─── Shadow Command ───
 
 @cli.command()
 def shadow():
-    """Process 10 unlabeled invoices in shadow mode."""
+    """Process 10 unlabeled invoices in shadow mode for human review."""
     from eval.runner import run_shadow
     from eval.report import format_shadow_report
     store = Store()
-    po_store = load_purchase_orders()
-    engine = Engine(store=store, po_store=po_store)
-    invoices = load_invoices()
-    results = run_shadow(engine, invoices)
+    invoices = load_invoices(unlabeled_only=True)
+    
+    results = []
+    for invoice in invoices:
+        result = process_invoice(invoice, store, shadow=True)
+        results.append(result)
+        
     click.echo(format_shadow_report(results, invoices))
 
 # ─── Resume Command ───
@@ -71,22 +75,40 @@ def shadow():
 @click.option("--approve", "decision", flag_value="approve", help="Approve the pending invoice")
 @click.option("--reject", "decision", flag_value="reject", help="Reject the pending invoice")
 def resume(invoice_id: str, decision: str):
-    """Resume a pending-approval or denied invoice."""
+    """Resume a pending invoice approval."""
     if decision is None:
         click.echo("Error: must specify --approve or --reject", err=True)
         raise SystemExit(1)
-    
+        
+    approve = (decision == "approve")
     store = Store()
-    po_store = load_purchase_orders()
-    engine = Engine(store=store, po_store=po_store)
-    try:
-        result = engine.resume(invoice_id, approved=(decision == "approve"))
-        _print_result(result)
-        if result.status == "posted":
-            click.echo(f"✓ Journal entries posted ({len(result.journal_entries)} entries)")
-    except ValueError as e:
-        click.echo(f"No pending approval found for {invoice_id}", err=True)
-        raise SystemExit(1)
+    pending_json = store.get_pending(invoice_id)
+    if not pending_json:
+        click.echo(f"No pending approval found for {invoice_id}")
+        return
+    
+    pending = ProcessingResult.model_validate_json(pending_json)
+    
+    if approve:
+        # Re-invoke the agent with the approval decision pre-loaded
+        invoice = load_invoice(invoice_id)
+        deps = AgentDeps(
+            invoice=invoice,
+            po_store=load_purchase_orders(),
+            store=store,
+        )
+        
+        result = ap_agent.run_sync(
+            f"Invoice {invoice_id} has been APPROVED by {pending.approval_level}. "
+            f"The classifications are: {json.dumps([c.model_dump() for c in pending.classifications])}. "
+            f"Call build_journal_entries and then save_to_db to complete the posting.",
+            deps=deps,
+        )
+        store.delete_pending(invoice_id)
+        click.echo(f"✅ Invoice {invoice_id} approved and posted.")
+    else:
+        store.delete_pending(invoice_id)
+        click.echo(f"❌ Invoice {invoice_id} rejected.")
 
 # ─── Feedback Command Group ───
 
@@ -124,10 +146,7 @@ def rerun():
     """Re-run eval and show before/after accuracy comparison."""
     from eval.feedback import rerun_with_comparison
     store = Store()
-    po_store = load_purchase_orders()
-    engine = Engine(store=store, po_store=po_store)
-    invoices = load_invoices()
-    click.echo(rerun_with_comparison(engine, invoices, store))
+    click.echo(rerun_with_comparison(store))
 
 # ─── Result Display Helper ───
 
@@ -137,36 +156,36 @@ def _print_result(result: ProcessingResult):
     click.echo(f"Invoice: {result.invoice_id}  |  Status: {result.status}")
     click.echo(f"{'═' * 50}")
 
-    if result.po_result:
-        po = result.po_result
-        click.echo(f"PO Match: {po.status}" +
-                   (f" (variance: {po.variance_pct:.1%})" if po.variance_pct else ""))
+    click.echo(f"PO Match: {result.po_match}")
 
-    for i, cl in enumerate(result.classifications):
-        if cl.classification:
-            c = cl.classification
-            posting = c.posting_gl or c.gl_code
-            click.echo(f"  Line {i}: {cl.line_item.description}")
-            click.echo(f"    → {posting} ({c.treatment.value})  [{c.rule_applied}]")
+    for cl in result.classifications:
+        click.echo(f"  Line {cl.line_index}: {cl.description}")
+        click.echo(f"    → {cl.gl_code} ({cl.treatment})  [{cl.rule_applied}]")
 
-    if result.approval:
-        click.echo(f"Approval: {result.approval.level.value} — {result.approval.reason}")
+    if result.approval_level:
+        click.echo(f"Approval: {result.approval_level} — {result.approval_reason}")
 
     if result.journal_entries:
         click.echo(f"\nJournal Entries ({len(result.journal_entries)}):")
         for entry in result.journal_entries:
-            click.echo(f"  [{entry.entry_type}] {entry.date} — {entry.description}")
-            for line in entry.lines:
-                if line.debit > 0:
-                    click.echo(f"    Dr  {line.account_code} {line.account_name:40s} {line.debit:>12}")
-                if line.credit > 0:
-                    click.echo(f"    Cr  {line.account_code} {line.account_name:40s} {' '*12}{line.credit:>12}")
+            # Assuming journal entry models have been formatted as dicts from the tool
+            desc = entry.get("description", "")
+            date_str = entry.get("date", "")
+            click.echo(f"  {date_str} — {desc}")
+            for line in entry.get("lines", []):
+                debit = float(line.get("debit", 0))
+                credit = float(line.get("credit", 0))
+                acct = line.get("account_code", "")
+                name = line.get("account_name", "")
+                if debit > 0:
+                    click.echo(f"    Dr  {acct} {name:40s} {debit:>12}")
+                if credit > 0:
+                    click.echo(f"    Cr  {acct} {name:40s} {' '*12}{credit:>12}")
 
     for err in result.errors:
         click.echo(f"  ⚠ {err}", err=True)
     for warn in result.warnings:
         click.echo(f"  ⓘ {warn}")
-
 
 if __name__ == "__main__":
     cli()

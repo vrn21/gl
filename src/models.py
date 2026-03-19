@@ -3,6 +3,7 @@ from datetime import date
 from decimal import Decimal
 from enum import Enum
 from pydantic import BaseModel, Field, model_validator
+from typing import Literal
 
 class Treatment(str, Enum):
     EXPENSE = "expense"
@@ -96,16 +97,22 @@ class POMatchResult(BaseModel):
     reason: str = ""
 
 class ClassifiedLine(BaseModel):
-    line_item: LineItem
-    classification: Classification | None    # None if unclassifiable
+    line_index: int
+    description: str
+    amount: str
+    gl_code: str
+    gl_account_name: str
+    treatment: Literal["expense", "prepaid", "accrual", "capitalize"]
+    rule_applied: str  # The agent's reasoning for this classification
 
 class ProcessingResult(BaseModel):
     invoice_id: str
-    invoice_total: Decimal | None = None    # Stored for verification on resume
-    status: str                             # "posted", "pending_approval", "flagged", "error"
-    po_result: POMatchResult | None = None
-    classifications: list[ClassifiedLine] = Field(default_factory=list)
-    approval: ApprovalDecision | None = None
-    journal_entries: list[JournalEntry] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
+    status: Literal["posted", "pending_approval", "flagged", "denied", "dry_run", "shadow"]
+    po_match: Literal["matched", "no_po", "unmatched", "variance_exceeded"]
+    classifications: list[ClassifiedLine]
+    approval_level: str | None = None
+    approval_reason: str | None = None
+    journal_entries: list[dict] | None = None
+    verification_passed: bool | None = None
+    errors: list[str] = []
+    warnings: list[str] = []
